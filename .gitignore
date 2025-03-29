@@ -1,4 +1,7 @@
 # Byte-compiled / optimized / DLL files
+init.py
+main.py
+rag.py
 dataset/
 __pycache__/
 *.py[cod]
