@@ -24,7 +24,7 @@ FAISS에서 Query와 유사한 문서 검색 후 답변 생성
 
 # TO DO
 1. hotpotqa 통합
-2. FAISS 데이터 저장 파이프라인 구현
-3. generation part 구현
+2. FAISS 데이터 저장 파이프라인 구현 - 방병훈
+3. generation part 구현 - 방병훈
 4. kvcache 추가
 
