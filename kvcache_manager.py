@@ -137,11 +137,34 @@ I'll remember the context you've provided and use it to answer your questions.
                     import torch.serialization
                     from transformers.cache_utils import DynamicCache
                     torch.serialization.add_safe_globals([DynamicCache])
-                    kv_cache = torch.load(path, map_location=self.model.device if self.model else "cpu")
+                    
+                    kv_cache = torch.load(path, map_location="cpu")
+                    
+                    if self.model:
+                        target_device = self.model.device
+                        for i in range(len(kv_cache.key_cache)):
+                            kv_cache.key_cache[i] = kv_cache.key_cache[i].to(target_device)
+                            kv_cache.value_cache[i] = kv_cache.value_cache[i].to(target_device)
+                        
+                        if not hasattr(kv_cache, 'cache_position') or kv_cache.cache_position is None:
+                            kv_len = kv_cache.key_cache[0].shape[-2]
+                            kv_cache.cache_position = torch.tensor([kv_len], dtype=torch.long, device=target_device)
+                    
                 except Exception as e1:
                     try:
                         print(f"안전 모드로 다시 시도 중...")
-                        kv_cache = torch.load(path, map_location=self.model.device if self.model else "cpu", weights_only=False)
+                        kv_cache = torch.load(path, map_location="cpu", weights_only=False)
+                        
+                        if self.model:
+                            target_device = self.model.device
+                            for i in range(len(kv_cache.key_cache)):
+                                kv_cache.key_cache[i] = kv_cache.key_cache[i].to(target_device)
+                                kv_cache.value_cache[i] = kv_cache.value_cache[i].to(target_device)
+                            
+                            if not hasattr(kv_cache, 'cache_position') or kv_cache.cache_position is None:
+                                kv_len = kv_cache.key_cache[0].shape[-2]
+                                kv_cache.cache_position = torch.tensor([kv_len], dtype=torch.long, device=target_device)
+                        
                     except Exception as e2:
                         print(f"KV-Cache 로드 오류: {e2}")
                         return None
@@ -191,41 +214,59 @@ I'll remember the context you've provided and use it to answer your questions.
             kv_cache.value_cache[i] = kv_cache.value_cache[i][:, :, :origin_len, :]
         
         return kv_cache
-    
+        
     def generate_with_kvcache(self, 
-                             query: str, 
-                             kv_cache: DynamicCache, 
-                             max_new_tokens: int = 256,
-                             temperature: float = 0.7) -> str:
-
+                            query: str, 
+                            kv_cache: DynamicCache, 
+                            max_new_tokens: int = 256,
+                            temperature: float = 0.7) -> str:
         model, tokenizer = self.load_model()
         
-        kv_len = kv_cache.key_cache[0].shape[-2]
+        embed_device = model.model.embed_tokens.weight.device
+        
+        for i in range(len(kv_cache.key_cache)):
+            kv_cache.key_cache[i] = kv_cache.key_cache[i].to(embed_device)
+            kv_cache.value_cache[i] = kv_cache.value_cache[i].to(embed_device)
         
         prompt = f"""
-<|start_header_id|>user<|end_header_id|>
-{query}
-<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-"""
+    <|start_header_id|>user<|end_header_id|>
+    {query}
+    <|eot_id|>
+    <|start_header_id|>assistant<|end_header_id|>
+    """
         
-        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-        attention_mask = torch.ones_like(input_ids)
+        origin_ids = tokenizer.encode(prompt, return_tensors="pt")
+        input_ids = origin_ids.to(embed_device)
         
-        generated_ids = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=kv_cache, 
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=(temperature > 0),
-            use_cache=True
-        )
+        output_ids = input_ids.clone()
+        next_token = input_ids
         
-        input_length = input_ids.shape[1]
-        generated_text = tokenizer.decode(generated_ids[0, input_length:], skip_special_tokens=True)
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                outputs = model(
+                    input_ids=next_token, 
+                    past_key_values=kv_cache,
+                    use_cache=True
+                )
+                next_token_logits = outputs.logits[:, -1, :]
+                
+                if temperature > 0:
+                    next_token_logits = next_token_logits / temperature
+                    probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = next_token_logits.argmax(dim=-1).unsqueeze(-1)
+                
+                next_token = next_token.to(embed_device)
+                
+                kv_cache = outputs.past_key_values
+                
+                output_ids = torch.cat([output_ids, next_token], dim=1)
+                
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
         
-        self.clean_kvcache(kv_cache, kv_len)
+        generated_text = tokenizer.decode(output_ids[0, origin_ids.shape[1]:], skip_special_tokens=True)
         
         return generated_text
     
